@@ -15,8 +15,8 @@ PORT = 35601
 PASSWORD = "USER_DEFAULT_PASSWORD"
 INTERVAL = 1
 PORBEPORT = 80
-#CU = "cu.tz.cloudcpp.com"
-CU = "1.1.1.1"
+CU = "cu.tz.cloudcpp.com"
+#CU = "1.1.1.1"
 CT = "ct.tz.cloudcpp.com"
 CM = "cm.tz.cloudcpp.com"
 
