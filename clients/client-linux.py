@@ -1,34 +1,42 @@
-#!/usr/bin/env python
+#!/usr/bin/env python3
 # coding: utf-8
-# Update by : https://github.com/cppla/ServerStatus
-# 支持Python版本：2.7 to 3.7
+# Update by : https://github.com/cppla/ServerStatus, Update date: 20220530
+# 版本：1.0.3, 支持Python版本：2.7 to 3.10
 # 支持操作系统： Linux, OSX, FreeBSD, OpenBSD and NetBSD, both 32-bit and 64-bit architectures
-# 时间: 20200407
+# ONLINE_PACKET_HISTORY_LEN， 探测间隔120s，记录24小时在线率（720）；探测时间180s，记录24小时（480）；探测间隔60s，记录7天（10080）
 # 说明: 默认情况下修改server和user就可以了。丢包率监测方向可以自定义，例如：CU = "www.facebook.com"。
 
 SERVER = "127.0.0.1"
 USER = "s01"
 
 
-
-PORT = 35601
 PASSWORD = "USER_DEFAULT_PASSWORD"
-INTERVAL = 1
-PORBEPORT = 80
+PORT = 35601
 CU = "cu.tz.cloudcpp.com"
 #CU = "1.1.1.1"
 CT = "ct.tz.cloudcpp.com"
 CM = "cm.tz.cloudcpp.com"
+PROBEPORT = 80
+PROBE_PROTOCOL_PREFER = "ipv4"  # ipv4, ipv6
+PING_PACKET_HISTORY_LEN = 100
+ONLINE_PACKET_HISTORY_LEN = 480
+INTERVAL = 1
 
 import socket
+import ssl
 import time
 import timeit
 import re
 import os
 import sys
 import json
+import errno
 import subprocess
 import threading
+if sys.version_info.major == 3:
+    from queue import Queue
+elif sys.version_info.major == 2:
+    from Queue import Queue
 
 def get_uptime():
     with open('/proc/uptime', 'r') as f:
@@ -113,18 +121,6 @@ def tupd():
     d = int(s[:-1])-2
     return t,u,p,d
 
-def ip_status():
-    ip_check = 0
-    for i in [CU, CT, CM]:
-        try:
-            socket.create_connection((i, PORBEPORT), timeout=1).close()
-        except:
-            ip_check += 1
-    if ip_check >= 2:
-        return False
-    else:
-        return True
-
 def get_network(ip_version):
     if(ip_version == 4):
         HOST = "ipv4.google.com"
@@ -154,30 +150,47 @@ netSpeed = {
     'avgrx': 0,
     'avgtx': 0
 }
+diskIO = {
+    'read': 0,
+    'write': 0
+}
+monitorServer = {}
 
 def _ping_thread(host, mark, port):
     lostPacket = 0
-    allPacket = 0
-    startTime = time.time()
+    packet_queue = Queue(maxsize=PING_PACKET_HISTORY_LEN)
 
     while True:
+        # flush dns , every time.
+        IP = host
+        if host.count(':') < 1:  # if not plain ipv6 address, means ipv4 address or hostname
+            try:
+                if PROBE_PROTOCOL_PREFER == 'ipv4':
+                    IP = socket.getaddrinfo(host, None, socket.AF_INET)[0][4][0]
+                else:
+                    IP = socket.getaddrinfo(host, None, socket.AF_INET6)[0][4][0]
+            except Exception:
+                pass
+
+        if packet_queue.full():
+            if packet_queue.get() == 0:
+                lostPacket -= 1
         try:
             b = timeit.default_timer()
-            socket.create_connection((host, port), timeout=1).close()
-            pingTime[mark] = int((timeit.default_timer()-b)*1000)
-        except:
-            lostPacket += 1
-        finally:
-            allPacket += 1
+            socket.create_connection((IP, port), timeout=1).close()
+            pingTime[mark] = int((timeit.default_timer() - b) * 1000)
+            packet_queue.put(1)
+        except socket.error as error:
+            if error.errno == errno.ECONNREFUSED:
+                pingTime[mark] = int((timeit.default_timer() - b) * 1000)
+                packet_queue.put(1)
+            #elif error.errno == errno.ETIMEDOUT:
+            else:
+                lostPacket += 1
+                packet_queue.put(0)
 
-        if allPacket > 100:
-            lostRate[mark] = float(lostPacket) / allPacket
-
-        endTime = time.time()
-        if endTime - startTime > 3600:
-            lostPacket = 0
-            allPacket = 0
-            startTime = endTime
+        if packet_queue.qsize() > 30:
+            lostRate[mark] = float(lostPacket) / packet_queue.qsize()
 
         time.sleep(INTERVAL)
 
@@ -206,13 +219,78 @@ def _net_speed():
             netSpeed["avgtx"] = avgtx
         time.sleep(INTERVAL)
 
-def get_realtime_date():
+def _disk_io():
+    '''
+    good luck for opensource! by: cpp.la
+    磁盘IO：因为IOPS原因，SSD和HDD、包括RAID卡，ZFS等阵列技术。IO对性能的影响还需要结合自身服务器情况来判断。
+    比如我这里是机械硬盘，大量做随机小文件读写，那么很低的读写也就能造成硬盘长时间的等待。
+    如果这里做连续性IO，那么普通机械硬盘写入到100Mb/s，那么也能造成硬盘长时间的等待。
+    磁盘读写有误差：4k，8k ，https://stackoverflow.com/questions/34413926/psutil-vs-dd-monitoring-disk-i-o
+    :return:
+    '''
+    while True:
+        # pre pid snapshot
+        snapshot_first = {}
+        # next pid snapshot
+        snapshot_second = {}
+        # read count snapshot
+        snapshot_read = 0
+        # write count snapshot
+        snapshot_write = 0
+        # process snapshot
+        pid_snapshot = [str(i) for i in os.listdir("/proc") if i.isdigit() is True]
+        for pid in pid_snapshot:
+            try:
+                with open("/proc/{}/io".format(pid)) as f:
+                    pid_io = {}
+                    for line in f.readlines():
+                        if "read_bytes" in line:
+                            pid_io["read"] = int(line.split("read_bytes:")[-1].strip())
+                        elif "write_bytes" in line and "cancelled_write_bytes" not in line:
+                            pid_io["write"] = int(line.split("write_bytes:")[-1].strip())
+                    pid_io["name"] = open("/proc/{}/comm".format(pid), "r").read().strip()
+                    snapshot_first[pid] = pid_io
+            except:
+                if pid in snapshot_first:
+                    snapshot_first.pop(pid)
+
+        time.sleep(INTERVAL)
+
+        for pid in pid_snapshot:
+            try:
+                with open("/proc/{}/io".format(pid)) as f:
+                    pid_io = {}
+                    for line in f.readlines():
+                        if "read_bytes" in line:
+                            pid_io["read"] = int(line.split("read_bytes:")[-1].strip())
+                        elif "write_bytes" in line and "cancelled_write_bytes" not in line:
+                            pid_io["write"] = int(line.split("write_bytes:")[-1].strip())
+                    pid_io["name"] = open("/proc/{}/comm".format(pid), "r").read().strip()
+                    snapshot_second[pid] = pid_io
+            except:
+                if pid in snapshot_first:
+                    snapshot_first.pop(pid)
+                if pid in snapshot_second:
+                    snapshot_second.pop(pid)
+
+        for k, v in snapshot_first.items():
+            if snapshot_first[k]["name"] == snapshot_second[k]["name"] and snapshot_first[k]["name"] != "bash":
+                snapshot_read += (snapshot_second[k]["read"] - snapshot_first[k]["read"])
+                snapshot_write += (snapshot_second[k]["write"] - snapshot_first[k]["write"])
+        diskIO["read"] = snapshot_read
+        diskIO["write"] = snapshot_write
+
+def get_realtime_data():
+    '''
+    real time get system data
+    :return:
+    '''
     t1 = threading.Thread(
         target=_ping_thread,
         kwargs={
             'host': CU,
             'mark': '10010',
-            'port': PORBEPORT
+            'port': PROBEPORT
         }
     )
     t2 = threading.Thread(
@@ -220,7 +298,7 @@ def get_realtime_date():
         kwargs={
             'host': CT,
             'mark': '189',
-            'port': PORBEPORT
+            'port': PROBEPORT
         }
     )
     t3 = threading.Thread(
@@ -228,20 +306,103 @@ def get_realtime_date():
         kwargs={
             'host': CM,
             'mark': '10086',
-            'port': PORBEPORT
+            'port': PROBEPORT
         }
     )
     t4 = threading.Thread(
         target=_net_speed,
     )
-    t1.setDaemon(True)
-    t2.setDaemon(True)
-    t3.setDaemon(True)
-    t4.setDaemon(True)
-    t1.start()
-    t2.start()
-    t3.start()
-    t4.start()
+    t5 = threading.Thread(
+        target=_disk_io,
+    )
+    for ti in [t1, t2, t3, t4, t5]:
+        ti.daemon = True
+        ti.start()
+
+
+def _monitor_thread(name, host, interval, type):
+    lostPacket = 0
+    packet_queue = Queue(maxsize=ONLINE_PACKET_HISTORY_LEN)
+    while True:
+        if name not in monitorServer.keys():
+            break
+        if packet_queue.full():
+            if packet_queue.get() == 0:
+                lostPacket -= 1
+        try:
+            if type == "http":
+                address = host.replace("http://", "")
+                m = timeit.default_timer()
+                if PROBE_PROTOCOL_PREFER == 'ipv4':
+                    IP = socket.getaddrinfo(address, None, socket.AF_INET)[0][4][0]
+                else:
+                    IP = socket.getaddrinfo(address, None, socket.AF_INET6)[0][4][0]
+                monitorServer[name]["dns_time"] = int((timeit.default_timer() - m) * 1000)
+                m = timeit.default_timer()
+                k = socket.create_connection((IP, 80), timeout=6)
+                monitorServer[name]["connect_time"] = int((timeit.default_timer() - m) * 1000)
+                m = timeit.default_timer()
+                k.sendall("GET / HTTP/1.2\r\nHost:{}\r\nUser-Agent:ServerStatus/cppla\r\nConnection:close\r\n\r\n".format(address).encode('utf-8'))
+                response = b""
+                while True:
+                    data = k.recv(4096)
+                    if not data:
+                        break
+                    response += data
+                http_code = response.decode('utf-8').split('\r\n')[0].split()[1]
+                monitorServer[name]["download_time"] = int((timeit.default_timer() - m) * 1000)
+                k.close()
+                if http_code not in ['200', '204', '301', '302', '401']:
+                    raise Exception("http code not in 200, 204, 301, 302, 401")
+            elif type == "https":
+                context = ssl._create_unverified_context()
+                address = host.replace("https://", "")
+                m = timeit.default_timer()
+                if PROBE_PROTOCOL_PREFER == 'ipv4':
+                    IP = socket.getaddrinfo(address, None, socket.AF_INET)[0][4][0]
+                else:
+                    IP = socket.getaddrinfo(address, None, socket.AF_INET6)[0][4][0]
+                monitorServer[name]["dns_time"] = int((timeit.default_timer() - m) * 1000)
+                m = timeit.default_timer()
+                k = socket.create_connection((IP, 443), timeout=6)
+                monitorServer[name]["connect_time"] = int((timeit.default_timer() - m) * 1000)
+                m = timeit.default_timer()
+                kk = context.wrap_socket(k, server_hostname=address)
+                kk.sendall("GET / HTTP/1.2\r\nHost:{}\r\nUser-Agent:ServerStatus/cppla\r\nConnection:close\r\n\r\n".format(address).encode('utf-8'))
+                response = b""
+                while True:
+                    data = kk.recv(4096)
+                    if not data:
+                        break
+                    response += data
+                http_code = response.decode('utf-8').split('\r\n')[0].split()[1]
+                monitorServer[name]["download_time"] = int((timeit.default_timer() - m) * 1000)
+                kk.close()
+                k.close()
+                if http_code not in ['200', '204', '301', '302', '401']:
+                    raise Exception("http code not in 200, 204, 301, 302, 401")
+            elif type == "tcp":
+                m = timeit.default_timer()
+                if PROBE_PROTOCOL_PREFER == 'ipv4':
+                    IP = socket.getaddrinfo(host.split(":")[0], None, socket.AF_INET)[0][4][0]
+                else:
+                    IP = socket.getaddrinfo(host.split(":")[0], None, socket.AF_INET6)[0][4][0]
+                monitorServer[name]["dns_time"] = int((timeit.default_timer() - m) * 1000)
+                m = timeit.default_timer()
+                k = socket.create_connection((IP, int(host.split(":")[1])), timeout=6)
+                monitorServer[name]["connect_time"] = int((timeit.default_timer() - m) * 1000)
+                m = timeit.default_timer()
+                k.send(b"GET / HTTP/1.2\r\n\r\n")
+                k.recv(1024)
+                monitorServer[name]["download_time"] = int((timeit.default_timer() - m) * 1000)
+                k.close()
+            packet_queue.put(1)
+        except Exception as e:
+            lostPacket += 1
+            packet_queue.put(0)
+        if packet_queue.qsize() > 5:
+            monitorServer[name]["online_rate"] = 1 - float(lostPacket) / packet_queue.qsize()
+        time.sleep(interval)
 
 def byte_str(object):
     '''
@@ -269,7 +430,7 @@ if __name__ == '__main__':
         elif 'INTERVAL' in argc:
             INTERVAL = int(argc.split('INTERVAL=')[-1])
     socket.setdefaulttimeout(30)
-    get_realtime_date()
+    get_realtime_data()
     while True:
         try:
             print("Connecting...")
@@ -289,6 +450,28 @@ if __name__ == '__main__':
             if data.find("You are connecting via") < 0:
                 data = byte_str(s.recv(1024))
                 print(data)
+                monitorServer.clear()
+                for i in data.split('\n'):
+                    if "monitor" in i and "type" in i and "{" in i and "}" in i:
+                        jdata = json.loads(i[i.find("{"):i.find("}")+1])
+                        monitorServer[jdata.get("name")] = {
+                            "type": jdata.get("type"),
+                            "dns_time": 0,
+                            "connect_time": 0,
+                            "download_time": 0,
+                            "online_rate": 1
+                        }
+                        t = threading.Thread(
+                            target=_monitor_thread,
+                            kwargs={
+                                'name': jdata.get("name"),
+                                'host': jdata.get("host"),
+                                'interval': jdata.get("interval"),
+                                'type': jdata.get("type")
+                            }
+                        )
+                        t.daemon = True
+                        t.start()
 
             timer = 0
             check_ip = 0
@@ -307,8 +490,6 @@ if __name__ == '__main__':
                 Load_1, Load_5, Load_15 = os.getloadavg()
                 MemoryTotal, MemoryUsed, SwapTotal, SwapFree = get_memory()
                 HDDTotal, HDDUsed = get_hdd()
-                IP_STATUS = ip_status()
-
                 array = {}
                 if not timer:
                     array['online' + str(check_ip)] = get_network(check_ip)
@@ -331,7 +512,6 @@ if __name__ == '__main__':
                 array['network_tx'] = netSpeed.get("nettx")
                 array['network_in'] = NET_IN
                 array['network_out'] = NET_OUT
-                array['ip_status'] = IP_STATUS
                 array['ping_10010'] = lostRate.get('10010') * 100
                 array['ping_189'] = lostRate.get('189') * 100
                 array['ping_10086'] = lostRate.get('10086') * 100
@@ -339,16 +519,20 @@ if __name__ == '__main__':
                 array['time_189'] = pingTime.get('189')
                 array['time_10086'] = pingTime.get('10086')
                 array['tcp'], array['udp'], array['process'], array['thread'] = tupd()
-
+                array['io_read'] = diskIO.get("read")
+                array['io_write'] = diskIO.get("write")
+                array['custom'] = "<br>".join(f"{k}\\t解析: {v['dns_time']}\\t连接: {v['connect_time']}\\t下载: {v['download_time']}\\t在线率: <code>{v['online_rate']*100:.1f}%</code>" for k, v in monitorServer.items())
                 s.send(byte_str("update " + json.dumps(array) + "\n"))
         except KeyboardInterrupt:
             raise
         except socket.error:
+            monitorServer.clear()
             print("Disconnected...")
             if 's' in locals().keys():
                 del s
             time.sleep(3)
         except Exception as e:
+            monitorServer.clear()
             print("Caught Exception:", e)
             if 's' in locals().keys():
                 del s
