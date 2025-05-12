@@ -110,13 +110,6 @@ void CMain::OnDelClient(int ClientNetID)
 {
 	int ClientID = ClientNetToClient(ClientNetID);
 	dbg_msg("main", "OnDelClient(ncid=%d, cid=%d)", ClientNetID, ClientID);
-    //copy offline message for watchdog
-    WatchdogMessage(ClientNetID,
-                    0, 0, 0, 0, 0, 0,
-                    0, 0, 0,0, 0, 0,
-                    0, 0, 0, 0, 0, 0,
-                    0, 0, 0,0, 0, 0,
-                    0, 0, 0, 0);
 	if(ClientID >= 0 && ClientID < NET_MAX_CLIENTS)
 	{
 		Client(ClientID)->m_Connected = false;
@@ -124,6 +117,10 @@ void CMain::OnDelClient(int ClientNetID)
 		Client(ClientID)->m_ClientNetType = NETTYPE_INVALID;
 		mem_zero(&Client(ClientID)->m_Stats, sizeof(CClient::CStats));
 	}
+    m_OfflineAlarmThreadData.pClients = m_aClients;
+    m_OfflineAlarmThreadData.pWatchDogs = m_aCWatchDogs;
+    m_OfflineAlarmThreadData.m_ReloadRequired = ClientID;
+    thread_create(offlineAlarmThread, &m_OfflineAlarmThreadData);
 }
 
 int CMain::HandleMessage(int ClientNetID, char *pMessage)
@@ -219,7 +216,8 @@ int CMain::HandleMessage(int ClientNetID, char *pMessage)
                         pClient->m_Stats.m_time_10010, pClient->m_Stats.m_time_189, pClient->m_Stats.m_time_10086,
                         pClient->m_Stats.m_tcpCount, pClient->m_Stats.m_udpCount, pClient->m_Stats.m_processCount,
                         pClient->m_Stats.m_threadCount, pClient->m_Stats.m_NetworkRx, pClient->m_Stats.m_NetworkTx,
-                        pClient->m_Stats.m_NetworkIN, pClient->m_Stats.m_NetworkOUT,pClient->m_Stats.m_MemTotal,
+                        pClient->m_Stats.m_NetworkIN, pClient->m_Stats.m_NetworkOUT,
+                        pClient->m_LastNetworkIN, pClient->m_LastNetworkOUT, pClient->m_Stats.m_MemTotal,
                         pClient->m_Stats.m_MemUsed, pClient->m_Stats.m_SwapTotal, pClient->m_Stats.m_SwapUsed,
                         pClient->m_Stats.m_HDDTotal, pClient->m_Stats.m_HDDUsed, pClient->m_Stats.m_IORead,
                         pClient->m_Stats.m_IOWrite, pClient->m_Stats.m_CPU, pClient->m_Stats.m_Online4,
@@ -271,7 +269,7 @@ int CMain::HandleMessage(int ClientNetID, char *pMessage)
 
 void CMain::WatchdogMessage(int ClientNetID, double load_1, double load_5, double load_15, double ping_10010, double ping_189, double ping_10086,
                             double time_10010, double time_189, double time_10086, double tcp_count, double udp_count, double process_count, double thread_count,
-                            double network_rx, double network_tx, double network_in, double network_out, double memory_total, double memory_used,
+                            double network_rx, double network_tx, double network_in, double network_out, double last_network_in, double last_network_out, double memory_total, double memory_used,
                             double swap_total, double swap_used, double hdd_total, double hdd_used, double io_read, double io_write, double cpu,
                             double online4, double online6)
 {
@@ -329,6 +327,8 @@ void CMain::WatchdogMessage(int ClientNetID, double load_1, double load_5, doubl
         symbol_table.add_variable("network_tx",network_tx);
         symbol_table.add_variable("network_in",network_in);
         symbol_table.add_variable("network_out",network_out);
+        symbol_table.add_variable("last_network_in",last_network_in);
+        symbol_table.add_variable("last_network_out",last_network_out);
         symbol_table.add_variable("memory_total",memory_total);
         symbol_table.add_variable("memory_used",memory_used);
         symbol_table.add_variable("swap_total",swap_total);
@@ -353,6 +353,11 @@ void CMain::WatchdogMessage(int ClientNetID, double load_1, double load_5, doubl
             time_t currentStamp = (long long)time(/*ago*/0);
             if ((currentStamp-Client(ClientID)->m_AlarmLastTime) > Watchdog(ID)->m_aInterval)
             {
+                if (!Client(ClientID)->m_Stats.m_Online4 && !Client(ClientID)->m_Stats.m_Online6)
+                {
+                    //休眠5分钟如果5分钟后状态发生了变更，消息不发出。
+                    printf("download\n");
+                }
                 Client(ClientID)->m_AlarmLastTime = currentStamp;
                 CURL *curl;
                 CURLcode res;
@@ -496,6 +501,109 @@ void CMain::JSONUpdateThread(void *pUser)
     char aJSONFileTmp[1024];
     str_format(aJSONFileTmp, sizeof(aJSONFileTmp), "%s~", pConfig->m_aJSONFile);
     fs_rename(pConfig->m_aJSONFile, aJSONFileTmp);
+}
+
+void CMain::offlineAlarmThread(void *pUser)
+{
+    CJSONUpdateThreadData *m_OfflineAlarmThreadData = (CJSONUpdateThreadData *)pUser;
+    CClient *pClients = m_OfflineAlarmThreadData->pClients;
+    CWatchDog *pWatchDogs = m_OfflineAlarmThreadData->pWatchDogs;
+    volatile short ClientID = m_OfflineAlarmThreadData->m_ReloadRequired;
+    thread_sleep(25000);
+    if(!pClients[ClientID].m_Connected)
+    {
+        int ID = 0;
+        while (strcmp(pWatchDogs[ID].m_aName, "NULL"))
+        {
+            typedef exprtk::symbol_table<double> symbol_table_t;
+            typedef exprtk::expression<double>   expression_t;
+            typedef exprtk::parser<double>       parser_t;
+            const std::string expression_string = pWatchDogs[ID].m_aRule;
+            std::string username = pClients[ClientID].m_aUsername;
+            std::string name = pClients[ClientID].m_aName;
+            std::string type = pClients[ClientID].m_aType;
+            std::string host = pClients[ClientID].m_aHost;
+            std::string location = pClients[ClientID].m_aLocation;
+            std::double_t online4 = pClients[ClientID].m_Stats.m_Online4;
+            std::double_t online6 = pClients[ClientID].m_Stats.m_Online6;
+
+            symbol_table_t symbol_table;
+            symbol_table.add_stringvar("username", username);
+            symbol_table.add_stringvar("name", name);
+            symbol_table.add_stringvar("type", type);
+            symbol_table.add_stringvar("host", host);
+            symbol_table.add_stringvar("location", location);
+            symbol_table.add_variable("online4",online4);
+            symbol_table.add_variable("online6",online6);
+            symbol_table.add_constants();
+
+            expression_t expression;
+            expression.register_symbol_table(symbol_table);
+
+            parser_t parser;
+            parser.compile(expression_string,expression);
+
+            if (expression.value() > 0)
+            {
+                time_t currentStamp = (long long)time(/*ago*/0);
+                if ((currentStamp-pClients[ClientID].m_AlarmLastTime) > pWatchDogs[ID].m_aInterval)
+                {
+                    printf("客户端下线且超过阈值, Client disconnects and sends alert information\n");
+                    pClients[ClientID].m_AlarmLastTime = currentStamp;
+                    CURL *curl;
+                    CURLcode res;
+                    curl_global_init(CURL_GLOBAL_ALL);
+
+                    curl = curl_easy_init();
+                    if(curl) {
+                        //standard time
+                        char standardTime[32]= { 0 };
+                        strftime(standardTime, sizeof(standardTime), "%Y-%m-%d %H:%M:%S",localtime(&currentStamp));
+
+                        //url encode, Rules conflict with url special characters，eg：&, del rules, by https://cpp.la, 2023-10-09
+                        char encodeBuffer[2048] = { 0 };
+                        sprintf(encodeBuffer, "【告警名称】 %s \n\n【告警时间】 %s  \n\n【用户名】 %s \n\n【节点名】 %s \n\n【虚拟化】 %s \n\n【主机名】 %s \n\n【位  置】 %s",
+                                pWatchDogs[ID].m_aName,
+                                standardTime,
+                                pClients[ClientID].m_aUsername,
+                                pClients[ClientID].m_aName,
+                                pClients[ClientID].m_aType,
+                                pClients[ClientID].m_aHost,
+                                pClients[ClientID].m_aLocation);
+                        char *encodeUrl = curl_easy_escape(curl, encodeBuffer, strlen(encodeBuffer));
+
+                        //standard url
+                        char urlBuffer[2048] = { 0 };
+                        sprintf(urlBuffer, "%s%s",pWatchDogs[ID].m_aCallback, encodeUrl);
+
+
+                        curl_easy_setopt(curl, CURLOPT_POST, 1L);
+                        curl_easy_setopt(curl, CURLOPT_URL, urlBuffer);
+                        curl_easy_setopt(curl, CURLOPT_POSTFIELDS,"signature=ServerStatus");
+                        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 0);
+                        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 0);
+                        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, 3L);
+                        curl_easy_setopt(curl, CURLOPT_TIMEOUT, 6L);
+                        res = curl_easy_perform(curl);
+                        if(res != CURLE_OK)
+                            fprintf(stderr, "watchdog failed: %s\n", curl_easy_strerror(res));
+                        if(encodeUrl)
+                            curl_free(encodeUrl);
+                        curl_easy_cleanup(curl);
+                    }
+                    curl_global_cleanup();
+                }
+                else
+                    printf("客户端下线但未超过阈值，No alarm if the threshold is not exceeded\n");
+            }
+            ID++;
+        }
+    }
+    else
+    {
+        printf("网络波动，No alarm information is sent due to network fluctuations\n");
+    }
+    fflush(stdout);
 }
 
 int CMain::ReadConfig()
@@ -696,6 +804,7 @@ int CMain::Run()
 	m_JSONUpdateThreadData.m_ReloadRequired = 2;
 	m_JSONUpdateThreadData.pClients = m_aClients;
 	m_JSONUpdateThreadData.pConfig = &m_Config;
+    m_JSONUpdateThreadData.pWatchDogs = m_aCWatchDogs;
 	void *LoadThread = thread_create(JSONUpdateThread, &m_JSONUpdateThreadData);
 	//thread_detach(LoadThread);
 
